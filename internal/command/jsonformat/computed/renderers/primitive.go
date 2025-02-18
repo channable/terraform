@@ -6,15 +6,17 @@ package renderers
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/zclconf/go-cty/cty"
 
-	"github.com/hashicorp/terraform/internal/command/jsonformat/collections"
 	"github.com/hashicorp/terraform/internal/command/jsonformat/computed"
 	"github.com/hashicorp/terraform/internal/command/jsonformat/structured"
 	"github.com/hashicorp/terraform/internal/command/jsonformat/structured/attribute_path"
 	"github.com/hashicorp/terraform/internal/plans"
+
+	diffLibrary "github.com/go-corelibs/diff"
 )
 
 var _ computed.DiffRenderer = (*primitiveRenderer)(nil)
@@ -153,33 +155,33 @@ func (renderer primitiveRenderer) renderStringDiff(diff computed.Diff, indent in
 			return fmt.Sprintf("%s %s %s%s", beforeString.RenderSimple(), opts.Colorize.Color("[yellow]->[reset]"), afterString.RenderSimple(), forcesReplacement(diff.Replace, opts))
 		}
 
-		beforeLines := strings.Split(beforeString.String, "\n")
-		afterLines := strings.Split(afterString.String, "\n")
+		// Multi-line string diffing:
+		// Generate an unified diff file via go-corelibs/diff (name chosen by
+		// library author, not a standard library), colorize the change markers
+		// and print it.
 
-		processIndices := func(beforeIx, afterIx int) {
-			if beforeIx < 0 || beforeIx >= len(beforeLines) {
-				lines = append(lines, fmt.Sprintf("%s%s%s", formatIndent(indent+1), writeDiffActionSymbol(plans.Create, opts), afterLines[afterIx]))
-				return
+		// Compute diff:
+		delta := diffLibrary.New("", beforeString.String, afterString.String)
+		diffString, err := delta.Unified()
+
+		if err == nil {
+			// Colorize the change markers at the beginning of each changed line:
+			plusRegex := regexp.MustCompile(`(?m)^\+`)
+			minusRegex := regexp.MustCompile(`(?m)^-`)
+			diffString = plusRegex.ReplaceAllLiteralString(diffString, opts.Colorize.Color("[green]+[reset]"))
+			diffString = minusRegex.ReplaceAllLiteralString(diffString, opts.Colorize.Color("[red]-[reset]"))
+
+			// Add all lines of the diff to the output with proper indentation.
+			diffLines := strings.Split(diffString, "\n")
+			// Skip the first two lines in diffLines (which will be `--- a` and
+			// `+++ b`) and the last line, which is an artifact of the diff
+			// ending with a trailing newline.
+			for _, diffLine := range diffLines[2 : len(diffLines)-1] {
+				lines = append(lines, fmt.Sprintf("%s%s", formatIndent(indent+1), diffLine))
 			}
-
-			if afterIx < 0 || afterIx >= len(afterLines) {
-				lines = append(lines, fmt.Sprintf("%s%s%s", formatIndent(indent+1), writeDiffActionSymbol(plans.Delete, opts), beforeLines[beforeIx]))
-				return
-			}
-
-			if beforeLines[beforeIx] != afterLines[afterIx] {
-				lines = append(lines, fmt.Sprintf("%s%s%s", formatIndent(indent+1), writeDiffActionSymbol(plans.Delete, opts), beforeLines[beforeIx]))
-				lines = append(lines, fmt.Sprintf("%s%s%s", formatIndent(indent+1), writeDiffActionSymbol(plans.Create, opts), afterLines[afterIx]))
-				return
-			}
-
-			lines = append(lines, fmt.Sprintf("%s%s%s", formatIndent(indent+1), writeDiffActionSymbol(plans.NoOp, opts), beforeLines[beforeIx]))
+		} else {
+			lines = append(lines, "ERROR: Could not compare strings\n")
 		}
-		isObjType := func(_ string) bool {
-			return false
-		}
-
-		collections.ProcessSlice(beforeLines, afterLines, processIndices, isObjType)
 	}
 
 	// We return early if we find non-multiline strings or JSON strings, so we
